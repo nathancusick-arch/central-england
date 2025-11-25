@@ -68,7 +68,7 @@ st.title("Central England Report Mapper")
 st.write("""
           1. Export the previous month's data
           2. Drop the file in the below box, it should then give you the output file in your downloads
-          3. Standard bits - Check data vs previous week, remove data already reported, paste over new data
+          3. Standard bits - paste over new data
           4. Copy and paste over values etc!!!
           5. Done.
           """)
