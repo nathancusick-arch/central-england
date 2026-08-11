@@ -1,7 +1,7 @@
 """Central England monthly test-purchase report generator.
 
 Run with:
-    streamlit run "Central England Report Mapper.py"
+    streamlit run "Central England Report Generator.py"
 
 The app accepts the new audit export, the previous LIVE workbook, and the
 current store database.  It returns a formula-driven LIVE workbook and a
@@ -23,6 +23,9 @@ import pandas as pd
 from openpyxl import load_workbook
 from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter
+
+
+GENERATOR_VERSION = "2026.08.12.1"
 
 
 REPORT_COLUMNS = [
@@ -318,7 +321,10 @@ def detect_report_month(records: list[dict[str, Any]]) -> tuple[date, list[str]]
 
 def _load_live_workbook(workbook_bytes: bytes):
     try:
-        workbook = load_workbook(io.BytesIO(workbook_bytes), data_only=False, keep_links=True)
+        # The legacy template contains stale cached links to source files that no
+        # longer exist.  Excel attempts to repair those link-cache parts unless
+        # they are deliberately omitted when the template is loaded.
+        workbook = load_workbook(io.BytesIO(workbook_bytes), data_only=False, keep_links=False)
     except Exception as exc:
         raise ReportGenerationError(f"The previous LIVE workbook could not be read: {exc}") from exc
     missing = [name for name in REQUIRED_LIVE_SHEETS if name not in workbook.sheetnames]
@@ -614,20 +620,24 @@ def _countif_formula(data_sheet: str, key_column: str, data_end: int, label_cell
 
 
 def _write_metric_formulas(sheet, row: int, label_cell: str, current_col: str, rolling_col: str,
-                           current_end: int, rolling_end: int) -> None:
+                           current_end: int, rolling_end: int, start_column: int = 2) -> None:
     current = {status: _countif_formula("This Period", current_col, current_end, label_cell, status)
                for status in ["PASS", "FAIL", "ABORT"]}
     rolling = {status: _countif_formula("R12M", rolling_col, rolling_end, label_cell, status)
                for status in ["PASS", "FAIL", "ABORT"]}
+    current_completed = get_column_letter(start_column + 1)
+    current_passes = get_column_letter(start_column + 3)
+    rolling_completed = get_column_letter(start_column + 6)
+    rolling_passes = get_column_letter(start_column + 8)
     formulas = [
         f"={current['PASS'][1:]}+{current['FAIL'][1:]}+{current['ABORT'][1:]}",
         f"={current['PASS'][1:]}+{current['FAIL'][1:]}", current["FAIL"], current["PASS"],
-        f'=IF(C{row}=0,"-",E{row}/C{row})',
+        f'=IF({current_completed}{row}=0,"-",{current_passes}{row}/{current_completed}{row})',
         f"={rolling['PASS'][1:]}+{rolling['FAIL'][1:]}+{rolling['ABORT'][1:]}",
         f"={rolling['PASS'][1:]}+{rolling['FAIL'][1:]}", rolling["FAIL"], rolling["PASS"],
-        f'=IF(H{row}=0,"-",J{row}/H{row})',
+        f'=IF({rolling_completed}{row}=0,"-",{rolling_passes}{row}/{rolling_completed}{row})',
     ]
-    for column, formula in enumerate(formulas, start=2):
+    for column, formula in enumerate(formulas, start=start_column):
         sheet.cell(row, column).value = formula
 
 
@@ -648,7 +658,10 @@ def update_store_performance(workbook, hierarchy: OrderedDict[str, HierarchyRow]
     for row, store in enumerate(hierarchy.values(), start=7):
         sheet.cell(row, 1).value = _excel_code(store.code)
         sheet.cell(row, 2).value = store.name
-        _write_metric_formulas(sheet, row, f"'Store Performance'!$A{row}", "IO", "IS", current_end, rolling_end)
+        _write_metric_formulas(
+            sheet, row, f"'Store Performance'!$A{row}", "IO", "IS",
+            current_end, rolling_end, start_column=3,
+        )
     data_end = 6 + len(hierarchy)
     desired_total_row = data_end + 2
     if desired_total_row < total_row:
@@ -987,6 +1000,46 @@ def _save_workbook(workbook) -> bytes:
     return output.getvalue()
 
 
+def _remove_invalid_defined_names(workbook, removed_sheets: set[str] | None = None) -> None:
+    """Remove legacy names that would make Excel repair workbook.xml."""
+    removed_sheets = removed_sheets or set()
+
+    def is_invalid(defined_name) -> bool:
+        reference = _text(getattr(defined_name, "attr_text", ""))
+        if "#REF!" in reference or re.search(r"\[\d+\]", reference):
+            return True
+        return any(
+            f"'{sheet_name}'!" in reference or f"{sheet_name}!" in reference
+            for sheet_name in removed_sheets
+        )
+
+    for name, defined_name in list(workbook.defined_names.items()):
+        if is_invalid(defined_name):
+            del workbook.defined_names[name]
+    for sheet in workbook.worksheets:
+        for name, defined_name in list(sheet.defined_names.items()):
+            if is_invalid(defined_name):
+                del sheet.defined_names[name]
+
+
+def _remove_external_formulas(workbook) -> None:
+    """Discard unused legacy formulas whose source workbooks are not included."""
+    for sheet in workbook.worksheets:
+        for row in sheet.iter_rows():
+            for cell in row:
+                if cell.data_type == "f" and re.search(r"\[\d+\]", str(cell.value)):
+                    cell.value = None
+
+
+def _select_opening_sheet(workbook, title: str) -> None:
+    """Make one worksheet the unambiguous tab selected when Excel opens."""
+    for sheet in workbook.worksheets:
+        sheet.sheet_view.tabSelected = False
+    target = workbook[title]
+    workbook.active = workbook._sheets.index(target)
+    target.sheet_view.tabSelected = True
+
+
 def generate_reports(csv_bytes: bytes, previous_live_bytes: bytes, store_bytes: bytes) -> GenerationResult:
     current_records, stats, warnings = map_audit_export(csv_bytes)
     report_month, month_warnings = detect_report_month(current_records)
@@ -1023,10 +1076,17 @@ def generate_reports(csv_bytes: bytes, previous_live_bytes: bytes, store_bytes: 
     workbook.calculation.fullCalcOnLoad = True
     workbook.calculation.forceFullCalc = True
     workbook.calculation.calcMode = "auto"
+    workbook._external_links = []
+    _remove_external_formulas(workbook)
+    _remove_invalid_defined_names(workbook)
     live_bytes = _save_workbook(workbook)
     workbook.close()
 
     client_workbook = load_workbook(io.BytesIO(live_bytes), data_only=False, keep_links=False)
+    removed_sheets = {
+        sheet_name for sheet_name in client_workbook.sheetnames
+        if sheet_name not in PUBLIC_SHEETS
+    }
     for sheet_name in list(client_workbook.sheetnames):
         if sheet_name not in PUBLIC_SHEETS:
             client_workbook.remove(client_workbook[sheet_name])
@@ -1035,6 +1095,8 @@ def generate_reports(csv_bytes: bytes, previous_live_bytes: bytes, store_bytes: 
         report_month, store_total_row, org_total_rows,
     )
     client_workbook._external_links = []
+    _remove_invalid_defined_names(client_workbook, removed_sheets)
+    _select_opening_sheet(client_workbook, "Summary Data")
     client_bytes = _save_workbook(client_workbook)
     client_workbook.close()
 
@@ -1065,6 +1127,7 @@ def run_app() -> None:
 
     st.set_page_config(page_title="Central England Report Generator", page_icon="📊", layout="wide")
     st.title("Central England Report Generator")
+    st.caption(f"Generator version {GENERATOR_VERSION}")
     st.write(
         "Upload the new monthly audit export, the previous month's LIVE report, and the current "
         "Store Database. The generator rolls the report forward and produces both delivery files."
