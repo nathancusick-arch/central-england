@@ -193,6 +193,84 @@ def org_perf(ws,d):
   ws.cell(r,6,f'=IF(C{r}=0,"-",E{r}/C{r})');ws.cell(r,11,f'=IF(H{r}=0,"-",J{r}/H{r})');tot.append(r);r+=2
  return tot
 
+
+def norm(v):
+ return '' if v is None else str(v).strip().casefold()
+
+def sync_region(ws,d):
+ """Update or append only Store DB rows that differ; preserve all unchanged and historical rows."""
+ rows={str(ws.cell(r,1).value).replace('.0','').strip():r for r in range(2,ws.max_row+1) if ws.cell(r,1).value is not None}
+ changed=[]; added=[]
+ last=max(rows.values(),default=1)
+ for _,x in d.iterrows():
+  code=str(x['Store Code']).strip(); desired=[code,code,code,x['Store Name'],x['Area Name'],x['Region']]
+  if code in rows:
+   r=rows[code]
+   if any(norm(ws.cell(r,c).value)!=norm(desired[c-1]) for c in range(1,7)):
+    for c,v in enumerate(desired,1): ws.cell(r,c).value=v
+    changed.append(code)
+  else:
+   last+=1
+   for c,v in enumerate(desired,1): ws.cell(last,c).value=v
+   added.append(code); rows[code]=last
+ return changed,added
+
+def sync_store_performance(ws,d):
+ """Leave existing rows untouched; update changed names and insert genuinely new Store DB sites."""
+ total=next((r for r in range(7,ws.max_row+1) if ws.cell(r,1).value=='Total'),ws.max_row+1)
+ rows={str(ws.cell(r,1).value).replace('.0','').strip():r for r in range(7,total) if ws.cell(r,1).value is not None}
+ changed=[]; added=[]
+ for _,x in d.iterrows():
+  code=str(x['Store Code']).strip(); name=x['Store Name']
+  if code in rows:
+   if norm(ws.cell(rows[code],2).value)!=norm(name): ws.cell(rows[code],2,name); changed.append(code)
+  else:
+   ws.insert_rows(total,1)
+   r=total; src=max(7,r-1)
+   for c in range(1,13): style(ws.cell(src,c),ws.cell(r,c))
+   ws.cell(r,1,code); ws.cell(r,2,name)
+   for c,mx in zip(range(3,7),'vcfp'): ws.cell(r,c,pf('Store Performance','This Period','IS',r,mx))
+   ws.cell(r,7,f'=IF(D{r}=0,"-",F{r}/D{r})')
+   for c,mx in zip(range(8,12),'vcfp'): ws.cell(r,c,pf('Store Performance','R12M','IS',r,mx))
+   ws.cell(r,12,f'=IF(I{r}=0,"-",K{r}/I{r})')
+   rows[code]=r; added.append(code); total+=1
+ if changed or added:
+  for c in [3,4,5,6,8,9,10,11]: ws.cell(total,c,f'=SUM({get_column_letter(c)}7:{get_column_letter(c)}{total-1})')
+  ws.cell(total,1,'Total'); ws.cell(total,7,f'=IF(D{total}=0,"-",F{total}/D{total})'); ws.cell(total,12,f'=IF(I{total}=0,"-",K{total}/I{total})')
+ return changed,added,total
+
+def current_org_labels(ws):
+ labels=[]
+ for r in range(7,ws.max_row+1):
+  v=ws.cell(r,1).value
+  if v not in (None,'Total'): labels.append(str(v).strip())
+ return set(labels)
+
+def sync_org_performance(ws,d):
+ """Rebuild the organisational list only when the Store DB introduces a previously absent area or manager."""
+ wanted=set(d['Area Name'].dropna().astype(str).str.strip())|set(d['Region'].dropna().astype(str).str.strip())
+ missing=sorted(wanted-current_org_labels(ws))
+ if not missing: return False,[],[]
+ # Preserve historical organisational labels needed by rolling-12-month reporting.
+ existing=current_org_labels(ws)
+ area=set(d['Area Name'].dropna().astype(str).str.strip())
+ managers=set(d['Region'].dropna().astype(str).str.strip())
+ # Existing labels not identifiable as a current manager remain in the area section.
+ area=sorted(area | (existing-managers)); managers=sorted(managers)
+ clear(ws,7,ws.max_row); r=7; totals=[]
+ for col,names in [('IB',area),('IA',managers)]:
+  first=r
+  for n in names:
+   ws.cell(r,1,n)
+   for c,mx in zip(range(2,6),'vcfp'): ws.cell(r,c,pf('Org Level Performance','This Period',col,r,mx))
+   ws.cell(r,6,f'=IF(C{r}=0,"-",E{r}/C{r})')
+   for c,mx in zip(range(7,11),'vcfp'): ws.cell(r,c,pf('Org Level Performance','R12M',col,r,mx))
+   ws.cell(r,11,f'=IF(H{r}=0,"-",J{r}/H{r})'); r+=1
+  ws.cell(r,1,'Total')
+  for c in [2,3,4,5,7,8,9,10]: ws.cell(r,c,f'=SUM({get_column_letter(c)}{first}:{get_column_letter(c)}{r-1})')
+  ws.cell(r,6,f'=IF(C{r}=0,"-",E{r}/C{r})'); ws.cell(r,11,f'=IF(H{r}=0,"-",J{r}/H{r})'); totals.append(r); r+=2
+ return True,missing,totals
+
 def generate(a,b,c):
  raw=csv_df(a);cur,missing=map_data(raw);m=month_of(cur);d=stores(c)
  wb=load_workbook(io.BytesIO(b.getvalue()),data_only=False)
@@ -205,7 +283,7 @@ def generate(a,b,c):
   if rs.cell(r,1).value is not None:old.append([rs.cell(r,z).value for z in range(1,len(COLUMN_MAP)+1)])
  hist=pd.DataFrame(old,columns=heads);hist['Actual Visit Date']=pd.to_datetime(hist['Actual Visit Date'],errors='coerce');start=(m-11).to_timestamp()
  hist=hist[(hist['Actual Visit Date']>=start)&(hist['Actual Visit Date']<m.to_timestamp())];roll=pd.concat([hist,cur],ignore_index=True).drop_duplicates('Visit',keep='last');write_data(rs,roll)
- region(wb['Region'],d);sr=store_perf(wb['Store Performance'],d);ot=org_perf(wb['Org Level Performance'],d);wb.calculation.fullCalcOnLoad=True;wb.calculation.forceFullCalc=True;wb.calculation.calcMode='auto'
+ r_changed,r_added=sync_region(wb['Region'],d); s_changed,s_added,sr=sync_store_performance(wb['Store Performance'],d); o_updated,o_missing,ot=sync_org_performance(wb['Org Level Performance'],d); wb.calculation.fullCalcOnLoad=True;wb.calculation.forceFullCalc=True;wb.calculation.calcMode='auto'
  stem=f"Central England Test Purchases Report - {m.strftime('%B %Y')}"
  with tempfile.TemporaryDirectory() as td:
   live=Path(td)/(stem+' LIVE.xlsx');wb.save(live);lo=shutil.which('libreoffice') or shutil.which('soffice')
@@ -228,7 +306,7 @@ def generate(a,b,c):
     mask=rd.dt.to_period('M').eq(mp); passed=(result[mask]=='PASS').sum(); failed=(result[mask]=='FAIL').sum(); completed=passed+failed
     trend.cell(6,col,passed/completed if completed else '-')
   np=Path(td)/(stem+'.xlsx');non.save(np);lb=live.read_bytes();nb=np.read_bytes()
- return lb,nb,stem,{'period':m.strftime('%B %Y'),'export_rows':len(raw),'rolling_rows':len(roll),'stores':len(d),'areas':d['Area Name'].nunique(),'managers':d['Region'].nunique(),'missing_optional_columns':missing,'store_total_row':sr,'org_total_rows':ot,'recalculated':bool(lo)}
+ return lb,nb,stem,{'period':m.strftime('%B %Y'),'export_rows':len(raw),'rolling_rows':len(roll),'stores':len(d),'areas':d['Area Name'].nunique(),'managers':d['Region'].nunique(),'missing_optional_columns':missing,'store_total_row':sr,'org_total_rows':ot,'region_updated':bool(r_changed or r_added),'region_changed_codes':r_changed,'region_added_codes':r_added,'store_performance_updated':bool(s_changed or s_added),'store_name_changes':s_changed,'store_additions':s_added,'org_level_performance_updated':o_updated,'new_org_labels':o_missing,'recalculated':bool(lo)}
 
 st.set_page_config(page_title='Central England Report Generator',layout='wide')
 st.title('Central England Report Generator')
