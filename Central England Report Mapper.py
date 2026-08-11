@@ -11,6 +11,7 @@ values-only client workbook for the month detected in the audit export.
 from __future__ import annotations
 
 import io
+import hashlib
 import re
 import zipfile
 from collections import Counter, OrderedDict
@@ -25,7 +26,7 @@ from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter
 
 
-GENERATOR_VERSION = "2026.08.12.1"
+GENERATOR_VERSION = "2026.08.12.2"
 
 
 REPORT_COLUMNS = [
@@ -1108,6 +1109,10 @@ def generate_reports(csv_bytes: bytes, previous_live_bytes: bytes, store_bytes: 
         archive.writestr(live_name, live_bytes)
         archive.writestr(client_name, client_bytes)
 
+    current_completed = [record for record in current_records if _record_result(record) in {"pass", "fail"}]
+    rolling_completed = [record for record in rolling_records if _record_result(record) in {"pass", "fail"}]
+    current_passes = sum(_record_result(record) == "pass" for record in current_completed)
+    rolling_passes = sum(_record_result(record) == "pass" for record in rolling_completed)
     stats.update({
         "rolling_rows": len(rolling_records),
         "rolling_rows_dropped": dropped,
@@ -1115,10 +1120,31 @@ def generate_reports(csv_bytes: bytes, previous_live_bytes: bytes, store_bytes: 
         "report_stores": len(hierarchy),
         "closed_history_stores": sum(store.status == "Closed" for store in hierarchy.values()),
         "unmapped_stores": sum(store.status == "Unmapped" for store in hierarchy.values()),
+        "completed_visits": len(current_completed),
+        "pass_rate": current_passes / len(current_completed) if current_completed else None,
+        "rolling_completed_visits": len(rolling_completed),
+        "rolling_pass_rate": rolling_passes / len(rolling_completed) if rolling_completed else None,
     })
     return GenerationResult(
         live_bytes, client_bytes, zip_buffer.getvalue(), live_name, client_name,
         report_month, stats, warnings,
+    )
+
+
+def _build_email_text(generated: GenerationResult) -> str:
+    pass_rate = generated.stats.get("pass_rate")
+    rolling_pass_rate = generated.stats.get("rolling_pass_rate")
+    pass_rate_text = f"{round(pass_rate * 100)}%" if pass_rate is not None else "N/A"
+    rolling_pass_rate_text = (
+        f"{round(rolling_pass_rate * 100)}%" if rolling_pass_rate is not None else "N/A"
+    )
+    return (
+        "Hi All,\n\n"
+        "Please find attached the Serve Legal report detailing the visits completed in "
+        f"{generated.report_month:%B}.\n\n"
+        f"As you’ll see from the report, the pass rate was {pass_rate_text} based on "
+        f"{generated.stats['completed_visits']} completed visits. Your Rolling 12-month pass rate "
+        f"currently stands at {rolling_pass_rate_text}."
     )
 
 
@@ -1150,48 +1176,72 @@ def run_app() -> None:
         store_upload = st.file_uploader("3. Current Store Database", type=["xlsm", "xlsx"])
 
     ready = audit_upload is not None and live_upload is not None and store_upload is not None
+    upload_payloads = None
+    upload_signature = None
+    if ready:
+        upload_payloads = (
+            audit_upload.getvalue(), live_upload.getvalue(), store_upload.getvalue()
+        )
+        upload_signature = tuple(
+            (upload.name, len(payload), hashlib.sha256(payload).hexdigest())
+            for upload, payload in zip(
+                (audit_upload, live_upload, store_upload), upload_payloads
+            )
+        )
+
+    if st.session_state.get("ce_report_input_signature") != upload_signature:
+        st.session_state.pop("ce_generated_report", None)
+        st.session_state["ce_report_input_signature"] = upload_signature
+
     if st.button("Generate reports", type="primary", disabled=not ready, use_container_width=True):
         try:
             with st.spinner("Generating and validating the new reports..."):
-                generated = generate_reports(
-                    audit_upload.getvalue(), live_upload.getvalue(), store_upload.getvalue()
-                )
-            st.success(f"{generated.report_month:%B %Y} reports generated successfully.")
-            metrics = st.columns(5)
-            labels = [
-                ("Included visits", "included_rows"), ("Rolling visits", "rolling_rows"),
-                ("Store DB sites", "database_stores"), ("Report sites", "report_stores"),
-                ("Unmapped sites", "unmapped_stores"),
-            ]
-            for column, (label, key) in zip(metrics, labels):
-                column.metric(label, generated.stats[key])
-            st.caption(
-                f"Removed {generated.stats['rapid_delivery_removed']} Rapid Delivery row(s) and "
-                f"{generated.stats['aborts_removed']} abort row(s). "
-                f"Dropped {generated.stats['rolling_rows_dropped']} row(s) outside the new rolling window."
-            )
-            for warning in generated.warnings:
-                st.warning(warning)
-            st.download_button(
-                "Download both reports (.zip)", generated.zip_bytes,
-                file_name=f"Central England Reports - {generated.report_month:%B %Y}.zip",
-                mime="application/zip", type="primary", use_container_width=True,
-            )
-            left, right = st.columns(2)
-            left.download_button(
-                "Download LIVE report", generated.live_bytes, generated.live_name,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
-            right.download_button(
-                "Download client report", generated.client_bytes, generated.client_name,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-            )
+                generated = generate_reports(*upload_payloads)
+            st.session_state["ce_generated_report"] = generated
         except ReportGenerationError as exc:
+            st.session_state.pop("ce_generated_report", None)
             st.error(str(exc))
         except Exception as exc:
+            st.session_state.pop("ce_generated_report", None)
             st.exception(exc)
+
+    generated = st.session_state.get("ce_generated_report")
+    if generated is not None:
+        st.success(f"{generated.report_month:%B %Y} reports generated successfully.")
+        metrics = st.columns(5)
+        labels = [
+            ("Included visits", "included_rows"), ("Rolling visits", "rolling_rows"),
+            ("Store DB sites", "database_stores"), ("Report sites", "report_stores"),
+            ("Unmapped sites", "unmapped_stores"),
+        ]
+        for column, (label, key) in zip(metrics, labels):
+            column.metric(label, generated.stats[key])
+        st.caption(
+            f"Removed {generated.stats['rapid_delivery_removed']} Rapid Delivery row(s) and "
+            f"{generated.stats['aborts_removed']} abort row(s). "
+            f"Dropped {generated.stats['rolling_rows_dropped']} row(s) outside the new rolling window."
+        )
+        for warning in generated.warnings:
+            st.warning(warning)
+        st.download_button(
+            "Download both reports (.zip)", generated.zip_bytes,
+            file_name=f"Central England Reports - {generated.report_month:%B %Y}.zip",
+            mime="application/zip", type="primary", use_container_width=True,
+        )
+        left, right = st.columns(2)
+        left.download_button(
+            "Download LIVE report", generated.live_bytes, generated.live_name,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        right.download_button(
+            "Download client report", generated.client_bytes, generated.client_name,
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+
+        st.markdown("###### Email Text")
+        st.code(_build_email_text(generated), language="text")
 
 
 if __name__ == "__main__":
