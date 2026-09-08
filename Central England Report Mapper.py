@@ -26,7 +26,7 @@ from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter
 
 
-GENERATOR_VERSION = "2026.08.12.2"
+GENERATOR_VERSION = "2026.09.08.2"
 
 
 REPORT_COLUMNS = [
@@ -133,6 +133,7 @@ REQUIRED_LIVE_SHEETS = [
 ]
 DATE_COLUMNS = {"Order Deadline", "Submitted Date", "Approved Date", "Actual Visit Date"}
 TIME_COLUMNS = {"Actual Visit Time"}
+EXCLUDED_AUDIT_ITEMS = {"rapid delivery", "allergens"}
 
 
 class ReportGenerationError(ValueError):
@@ -264,8 +265,9 @@ def map_audit_export(csv_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str, 
     item = frame["item_to_order"].fillna("").str.strip().str.casefold()
     result = frame["primary_result"].fillna("").str.strip().str.casefold()
     rapid_mask = item.eq("rapid delivery")
+    allergen_mask = item.eq("allergens")
     abort_mask = result.eq("abort")
-    excluded_mask = rapid_mask | abort_mask
+    excluded_mask = item.isin(EXCLUDED_AUDIT_ITEMS) | abort_mask
     filtered = frame.loc[~excluded_mask].copy()
     column_lookup = {_norm_header(column): column for column in frame.columns}
 
@@ -288,6 +290,7 @@ def map_audit_export(csv_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str, 
     stats = {
         "export_rows": len(frame),
         "rapid_delivery_removed": int(rapid_mask.sum()),
+        "allergens_removed": int(allergen_mask.sum()),
         "aborts_removed": int(abort_mask.sum()),
         "included_rows": len(records),
     }
@@ -307,7 +310,9 @@ def map_audit_export(csv_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str, 
 
 def detect_report_month(records: list[dict[str, Any]]) -> tuple[date, list[str]]:
     if not records:
-        raise ReportGenerationError("No rows remain after Rapid Delivery and abort visits are excluded.")
+        raise ReportGenerationError(
+            "No rows remain after Rapid Delivery, Allergen, and abort visits are excluded."
+        )
     months = Counter(_month_start(r["Actual Visit Date"]) for r in records)
     report_month, count = months.most_common(1)[0]
     warnings = []
@@ -463,6 +468,8 @@ def build_rolling_records(
     candidates = [
         record for record in previous_records
         if _text(record.get("Visit")) not in current_visits
+        and _text(record.get("Item to order")).casefold() not in EXCLUDED_AUDIT_ITEMS
+        and _record_result(record) != "abort"
     ] + current_records
     deduplicated: OrderedDict[str, dict[str, Any]] = OrderedDict()
     anonymous = 0
@@ -691,7 +698,32 @@ def _ensure_section_capacity(sheet, start_row: int, total_row: int, needed: int,
     if needed <= capacity:
         return total_row
     extra = needed - capacity
+    # openpyxl moves cell contents when inserting rows but does not move merged
+    # ranges.  The second section's B:F and G:K headings sit below this insertion
+    # point, so leaving their ranges behind can turn the first section's new
+    # Total cells into read-only MergedCell objects when the workbook is reopened.
+    shifted_merges = []
+    for merged_range in list(sheet.merged_cells.ranges):
+        if merged_range.max_row < total_row:
+            continue
+        sheet.unmerge_cells(str(merged_range))
+        min_row = merged_range.min_row
+        max_row = merged_range.max_row
+        if min_row >= total_row:
+            min_row += extra
+            max_row += extra
+        else:
+            max_row += extra
+        shifted_merges.append((
+            merged_range.min_col, min_row,
+            merged_range.max_col, max_row,
+        ))
     sheet.insert_rows(total_row, amount=extra)
+    for min_col, min_row, max_col, max_row in shifted_merges:
+        sheet.merge_cells(
+            start_row=min_row, start_column=min_col,
+            end_row=max_row, end_column=max_col,
+        )
     for row in range(total_row, total_row + extra):
         _copy_row_style(sheet, style_row, row, 11)
     return total_row + extra
@@ -1160,7 +1192,7 @@ def run_app() -> None:
     )
     with st.expander("What the generator updates"):
         st.markdown(
-            "- Filters Rapid Delivery visits and aborts, matching the former mapper.\n"
+            "- Filters Rapid Delivery, Allergen, and abort visits so only standard retail audits are reported.\n"
             "- Replaces **This Period** with the new export.\n"
             "- Adds the new month to **R12M**, removes the expired month, and de-duplicates visits.\n"
             "- Refreshes store names, areas, regional management, new sites, and active historical closures from the Store Database.\n"
@@ -1218,6 +1250,7 @@ def run_app() -> None:
             column.metric(label, generated.stats[key])
         st.caption(
             f"Removed {generated.stats['rapid_delivery_removed']} Rapid Delivery row(s) and "
+            f"{generated.stats['allergens_removed']} Allergen row(s), plus "
             f"{generated.stats['aborts_removed']} abort row(s). "
             f"Dropped {generated.stats['rolling_rows_dropped']} row(s) outside the new rolling window."
         )
