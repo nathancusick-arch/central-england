@@ -1,8 +1,5 @@
 """Central England monthly test-purchase report generator.
 
-Run with:
-    streamlit run "Central England Report Generator.py"
-
 The app accepts the new audit export, the previous LIVE workbook, and the
 current store database.  It returns a formula-driven LIVE workbook and a
 values-only client workbook for the month detected in the audit export.
@@ -26,7 +23,7 @@ from openpyxl.formula.translate import Translator
 from openpyxl.utils import get_column_letter
 
 
-GENERATOR_VERSION = "2026.09.08.2"
+GENERATOR_VERSION = "2026.10.08.1"
 
 
 REPORT_COLUMNS = [
@@ -134,6 +131,11 @@ REQUIRED_LIVE_SHEETS = [
 DATE_COLUMNS = {"Order Deadline", "Submitted Date", "Approved Date", "Actual Visit Date"}
 TIME_COLUMNS = {"Actual Visit Time"}
 EXCLUDED_AUDIT_ITEMS = {"rapid delivery", "allergens"}
+MIDCOUNTIES_UNIFORM_QUESTIONS = (
+    "Was the colleague wearing appropriate footwear (no brightly coloured trainers)?",
+    "Was the colleague wearing Co-op branded top, fleece or jacket?",
+    "Was the colleague wearing dark trousers (if they were wearing jeans, shorts, jogging/tracksuit bottoms you should answer no)?",
+)
 
 
 class ReportGenerationError(ValueError):
@@ -251,12 +253,53 @@ def _typed_report_value(header: str, value: Any) -> Any:
     return _text(value) if value is not None else ""
 
 
+def normalise_export_headers(frame: pd.DataFrame) -> pd.DataFrame:
+    """Remove question-ID prefixes and merge nonblank answers for shared titles."""
+    columns: dict[str, pd.Series] = {}
+    for position, header in enumerate(frame.columns):
+        title = re.sub(r"^Q\d+\s*-\s*", "", str(header))
+        answers = frame.iloc[:, position]
+        if title in columns:
+            blank = columns[title].isna() | columns[title].astype(str).str.strip().eq("")
+            columns[title] = columns[title].mask(blank, answers)
+        else:
+            columns[title] = answers
+    return pd.DataFrame(columns, index=frame.index)
+
+
+def _midcounties_audit_mask(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    """Identify Midcounties positively; Store DB absence never excludes a site.
+
+    The Midcounties survey has three uniform questions absent from the Central
+    England survey. Require answers to at least two, rather than relying on
+    column presence in an export containing both surveys.
+    """
+    names = frame.get("site_name", pd.Series("", index=frame.index)).fillna("").str.strip()
+    named = names.str.contains(
+        r"^(?:\[[^\]]+\]\s*)*H\s*[-–—]\s*|\bMidcounties\b", flags=re.I, regex=True,
+    )
+    lookup = {_norm_header(column): column for column in frame.columns}
+    uniform_answers = pd.Series(0, index=frame.index)
+    for question in MIDCOUNTIES_UNIFORM_QUESTIONS:
+        column = lookup.get(_norm_header(question))
+        if column is not None:
+            uniform_answers += frame[column].fillna("").str.strip().ne("").astype(int)
+    survey = uniform_answers.ge(2)
+    identified = named | survey
+    # Apply positive identification to other audits of the same system site,
+    # including rows with missing names or unanswered survey questions.
+    site_ids = frame["site_internal_id"].fillna("").str.strip().str.casefold()
+    known_ids = set(site_ids.loc[identified & site_ids.ne("")])
+    return identified | (site_ids.ne("") & site_ids.isin(known_ids)), survey & ~named
+
+
 def map_audit_export(csv_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str, int], list[str]]:
     try:
         frame = pd.read_csv(io.BytesIO(csv_bytes), dtype=str, encoding="utf-8-sig")
     except Exception as exc:
         raise ReportGenerationError(f"The audit export could not be read as CSV: {exc}") from exc
 
+    frame = normalise_export_headers(frame)
     required = {"item_to_order", "primary_result", "date_of_visit", "internal_id", "site_internal_id"}
     missing = sorted(required - set(frame.columns))
     if missing:
@@ -267,7 +310,9 @@ def map_audit_export(csv_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str, 
     rapid_mask = item.eq("rapid delivery")
     allergen_mask = item.eq("allergens")
     abort_mask = result.eq("abort")
-    excluded_mask = item.isin(EXCLUDED_AUDIT_ITEMS) | abort_mask
+    midcounties_mask, survey_only_mask = _midcounties_audit_mask(frame)
+    other_excluded_mask = item.isin(EXCLUDED_AUDIT_ITEMS) | abort_mask
+    excluded_mask = other_excluded_mask | midcounties_mask
     filtered = frame.loc[~excluded_mask].copy()
     column_lookup = {_norm_header(column): column for column in frame.columns}
 
@@ -292,6 +337,8 @@ def map_audit_export(csv_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str, 
         "rapid_delivery_removed": int(rapid_mask.sum()),
         "allergens_removed": int(allergen_mask.sum()),
         "aborts_removed": int(abort_mask.sum()),
+        "midcounties_identified": int(midcounties_mask.sum()),
+        "midcounties_removed": int((midcounties_mask & ~other_excluded_mask).sum()),
         "included_rows": len(records),
     }
     optional_sources = {
@@ -301,6 +348,11 @@ def map_audit_export(csv_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str, 
     available_normalised = {_norm_header(column) for column in frame.columns}
     absent_optional = sorted(column for column in optional_sources if _norm_header(column) not in available_normalised)
     warnings = []
+    if survey_only_mask.any():
+        warnings.append(
+            f"{int(survey_only_mask.sum())} Midcounties audit(s) were identified by uniform-question "
+            "answers despite lacking an H - prefix or Midcounties name, and were excluded."
+        )
     if absent_optional:
         warnings.append(
             f"{len(absent_optional)} optional mapped export column(s) were absent and were left blank."
@@ -311,7 +363,7 @@ def map_audit_export(csv_bytes: bytes) -> tuple[list[dict[str, Any]], dict[str, 
 def detect_report_month(records: list[dict[str, Any]]) -> tuple[date, list[str]]:
     if not records:
         raise ReportGenerationError(
-            "No rows remain after Rapid Delivery, Allergen, and abort visits are excluded."
+            "No rows remain after Midcounties, Rapid Delivery, Allergen, and abort visits are excluded."
         )
     months = Counter(_month_start(r["Actual Visit Date"]) for r in records)
     report_month, count = months.most_common(1)[0]
@@ -749,16 +801,21 @@ def _write_org_section(sheet, labels: list[str], start_row: int, total_row: int,
     return total_row
 
 
+def _second_org_section_start(sheet, first_total: int) -> int:
+    """Locate the lower section after any row insertions in prior reports."""
+    for row in range(first_total + 1, sheet.max_row + 1):
+        if _norm_header(sheet.cell(row, 2).value) == "number of visits":
+            return row + 1
+    raise ReportGenerationError("The second Org Level Performance section heading could not be found.")
+
+
 def update_org_performance(workbook, area_labels: list[str], region_labels: list[str],
                            current_end: int, rolling_end: int) -> tuple[int, int]:
     sheet = workbook["Org Level Performance"]
     first_total = next(row for row in range(7, sheet.max_row + 1)
                        if _text(sheet.cell(row, 1).value).casefold() == "total")
-    old_first_total = first_total
     first_total = _write_org_section(sheet, area_labels, 7, first_total, "IB", "IE", current_end, rolling_end)
-    shift = first_total - old_first_total
-    second_header = 28 + shift
-    second_start = second_header + 1
+    second_start = _second_org_section_start(sheet, first_total)
     second_total = next(row for row in range(second_start, sheet.max_row + 1)
                         if _text(sheet.cell(row, 1).value).casefold() == "total")
     second_total = _write_org_section(sheet, region_labels, second_start, second_total, "IA", "IF",
@@ -968,7 +1025,7 @@ def populate_static_reports(workbook, current_records: list[dict[str, Any]], rol
     first_total, second_total = org_total_rows
     for labels, start_row, total_row, attribute in [
         (area_labels, 7, first_total, "area"),
-        (region_labels, first_total + 5, second_total, "region"),
+        (region_labels, _second_org_section_start(org_sheet, first_total), second_total, "region"),
     ]:
         current_values = _metrics(current_records, lambda r, a=attribute: _record_bucket(r, hierarchy, a), labels)
         rolling_values = _metrics(rolling_records, lambda r, a=attribute: _record_bucket(r, hierarchy, a), labels)
@@ -1192,7 +1249,7 @@ def run_app() -> None:
     )
     with st.expander("What the generator updates"):
         st.markdown(
-            "- Filters Rapid Delivery, Allergen, and abort visits so only standard retail audits are reported.\n"
+            "- Excludes Midcounties audits using site names and survey answers, and filters Rapid Delivery, Allergen, and abort visits.\n"
             "- Replaces **This Period** with the new export.\n"
             "- Adds the new month to **R12M**, removes the expired month, and de-duplicates visits.\n"
             "- Refreshes store names, areas, regional management, new sites, and active historical closures from the Store Database.\n"
@@ -1252,6 +1309,7 @@ def run_app() -> None:
             f"Removed {generated.stats['rapid_delivery_removed']} Rapid Delivery row(s) and "
             f"{generated.stats['allergens_removed']} Allergen row(s), plus "
             f"{generated.stats['aborts_removed']} abort row(s). "
+            f"Excluded {generated.stats['midcounties_removed']} additional Midcounties row(s). "
             f"Dropped {generated.stats['rolling_rows_dropped']} row(s) outside the new rolling window."
         )
         for warning in generated.warnings:
